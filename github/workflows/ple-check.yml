@@ -1,0 +1,109 @@
+
+# PLE — GitHub Actions: validate the entry + run kit check with the dev model.
+#
+# WHAT IT DOES (and what it deliberately does NOT do):
+# - `validate` job: `kit validate` on submission.yaml. No Docker, no model,
+#   no secrets. Always runs; this is the gate that must stay green.
+# - `check-dev` job: full `kit check --no-smoke` (build + listen + model +
+#   smoke via the dev-model overlay). Runs ONLY when the repo has a
+#   MODEL_API_KEY secret (the NVIDIA NIM key, OpenAI-compatible endpoint).
+#   The overlay is a throwaway copy with model_api swapped to the dev model;
+#   the real submission.yaml (google-cloud/...) is never modified by CI.
+# - `eval-smoke` job (manual only): runs eval/run.py on ONE `checks` task
+#   (wind-diaphragm-shear — programmatic grading, no LLM judge needed)
+#   with --trials 1. Needs MODEL_API_KEY + HF_TOKEN secrets.
+#
+# KNOWN LIMITS (see PLAN.md §7 — do not "fix" by spending money silently):
+# - Free GA runners are 2-CPU / 7 GB. A full 29-task eval run sizes each slot
+#   at 6 CPUs / 16.25 GB, so full dev-set runs do NOT fit here; this workflow
+#   is for validation + 1-task smoke runs only. Full runs need a bigger
+#   machine (decide in Dec; no spend without the owner's OK).
+# - Local runs on google-cloud/<id> models need a LiteLLM proxy backed by
+#   Vertex AI in your own GCP project (BILLED to that project). There is no
+#   free local proxy. Dev runs use the NVIDIA NIM key instead; the committed
+#   model_api stays a google-cloud model (Stage 2 supplies the eval key free).
+# - Judge tasks (rubric / checks-judge) need a Claude Opus 5.5 judge; the dev
+#   model only approximates it. `checks` tasks are the honest smoke signal.
+#
+# SECRETS (owner adds in repo Settings > Secrets and variables > Actions):
+# - MODEL_API_KEY : NVIDIA NIM key (https://integrate.api.nvidia.com/v1).
+# - HF_TOKEN : Hugging Face read token ("Muse-ple") for the gated dataset.
+# Never commit keys. The workflow fails closed (skips) when a secret is absent.
+
+name: PLE check
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: entry
+      - name: Clone PLE kit (pinned)
+        run: git clone --depth 1 https://github.com/google-research/ple ple-kit
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+      - name: kit validate
+        working-directory: ple-kit
+        run: uv run python -m kit validate ../entry
+
+  check-dev:
+    needs: validate
+    if: secrets.MODEL_API_KEY != ''
+    runs-on: ubuntu-latest
+    env:
+      MODEL_API_KEY: ${{ secrets.MODEL_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: entry
+      - name: Clone PLE kit (pinned)
+        run: git clone --depth 1 https://github.com/google-research/ple ple-kit
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+      - name: Build dev overlay (throwaway git repo, dev model only)
+        run: |
+          cp -r entry /tmp/entry-dev
+          cd /tmp/entry-dev
+          sed -i 's|^model_api:.*|model_api: openai-compatible/nvidia-nemotron-3-nano-omni-30b-a3b-reasoning|' submission.yaml
+          printf 'model_base_url: https://integrate.api.nvidia.com/v1\n' >> submission.yaml
+          git init -q && git add -A && git -c user.name=ci -c user.email=ci@local commit -qm dev-overlay
+          grep -E '^(name|model_api|model_base_url):' submission.yaml
+      - name: kit check (no smoke)
+        working-directory: ple-kit
+        run: uv run python -m kit check /tmp/entry-dev --no-smoke --model-base-url https://integrate.api.nvidia.com/v1
+
+  eval-smoke:
+    needs: check-dev
+    if: github.event_name == 'workflow_dispatch' && secrets.MODEL_API_KEY != '' && secrets.HF_TOKEN != ''
+    runs-on: ubuntu-latest
+    env:
+      MODEL_API_KEY: ${{ secrets.MODEL_API_KEY }}
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: entry
+      - name: Clone PLE kit (pinned)
+        run: git clone --depth 1 https://github.com/google-research/ple ple-kit
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+      - name: Install Harbor
+        run: uv tool install harbor==0.20.0 --with websockets
+      - name: Build dev overlay (throwaway git repo, dev model only)
+        run: |
+          cp -r entry /tmp/entry-dev
+          cd /tmp/entry-dev
+          sed -i 's|^model_api:.*|model_api: openai-compatible/nvidia-nemotron-3-nano-omni-30b-a3b-reasoning|' submission.yaml
+          printf 'model_base_url: https://integrate.api.nvidia.com/v1\n' >> submission.yaml
+          git init -q && git add -A && git -c user.name=ci -c user.email=ci@local commit -qm dev-overlay
+      - name: Eval one checks task (wind-diaphragm-shear)
+        working-directory: ple-kit
+        run: |
+          printf 'MODEL_API_KEY=%s\nHF_TOKEN=%s\n' "$MODEL_API_KEY" "$HF_TOKEN" > /tmp/eval.env
+          uv run python eval/run.py /tmp/entry-dev --env-file /tmp/eval.env --tasks wind-diaphragm-shear --trials 1 --model-base-url https://integrate.api.nvidia.com/v1
