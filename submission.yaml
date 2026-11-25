@@ -1,0 +1,13 @@
+# submission.yaml — PLE entry (validated against the kit 2026-11-25)
+#
+# name: leaderboard entry name (2–39 chars). model_api is a PLACEHOLDER
+# choice (cheap/fast pareto candidate) — the final pick comes after
+# cross-model runs on the 29 dev tasks (see PLAN.md §3).
+# The harness reads model URL/key from env vars only. No API keys here.
+
+name: ple-harness
+model_api: google-cloud/gemini-3.8-flash
+install: >-
+  uv venv --python 3.12 /opt/harness/venv
+  && uv pip install --python /opt/harness/venv/bin/python -r {src}/requirements.txt
+serve: /opt/harness/venv/bin/python {src}/serve.py
