@@ -1,17 +1,18 @@
-
 # PLE — GitHub Actions: validate the entry + run kit check with the dev model.
 #
 # WHAT IT DOES (and what it deliberately does NOT do):
 # - `validate` job: `kit validate` on submission.yaml. No Docker, no model,
 #   no secrets. Always runs; this is the gate that must stay green.
 # - `check-dev` job: full `kit check --no-smoke` (build + listen + model +
-#   smoke via the dev-model overlay). Runs ONLY when the repo has a
-#   MODEL_API_KEY secret (the NVIDIA NIM key, OpenAI-compatible endpoint).
+#   smoke via the dev-model overlay). The kit-check step skips gracefully
+#   when no MODEL_API_KEY secret is set (job-level `if:` cannot read the
+#   `secrets` context — GitHub rejects the whole workflow file otherwise).
 #   The overlay is a throwaway copy with model_api swapped to the dev model;
 #   the real submission.yaml (google-cloud/...) is never modified by CI.
 # - `eval-smoke` job (manual only): runs eval/run.py on ONE `checks` task
 #   (wind-diaphragm-shear — programmatic grading, no LLM judge needed)
-#   with --trials 1. Needs MODEL_API_KEY + HF_TOKEN secrets.
+#   with --trials 1. Needs MODEL_API_KEY + HF_TOKEN secrets; the eval step
+#   skips gracefully when either is absent.
 #
 # KNOWN LIMITS (see PLAN.md §7 — do not "fix" by spending money silently):
 # - Free GA runners are 2-CPU / 7 GB. A full 29-task eval run sizes each slot
@@ -54,7 +55,6 @@ jobs:
 
   check-dev:
     needs: validate
-    if: secrets.MODEL_API_KEY != ''
     runs-on: ubuntu-latest
     env:
       MODEL_API_KEY: ${{ secrets.MODEL_API_KEY }}
@@ -76,11 +76,13 @@ jobs:
           grep -E '^(name|model_api|model_base_url):' submission.yaml
       - name: kit check (no smoke)
         working-directory: ple-kit
-        run: uv run python -m kit check /tmp/entry-dev --no-smoke --model-base-url https://integrate.api.nvidia.com/v1
+        run: |
+          if [ -z "$MODEL_API_KEY" ]; then echo "No MODEL_API_KEY secret — skipping kit check."; exit 0; fi
+          uv run python -m kit check /tmp/entry-dev --no-smoke --model-base-url https://integrate.api.nvidia.com/v1
 
   eval-smoke:
     needs: check-dev
-    if: github.event_name == 'workflow_dispatch' && secrets.MODEL_API_KEY != '' && secrets.HF_TOKEN != ''
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     env:
       MODEL_API_KEY: ${{ secrets.MODEL_API_KEY }}
@@ -105,5 +107,6 @@ jobs:
       - name: Eval one checks task (wind-diaphragm-shear)
         working-directory: ple-kit
         run: |
+          if [ -z "$MODEL_API_KEY" ] || [ -z "$HF_TOKEN" ]; then echo "Missing MODEL_API_KEY or HF_TOKEN secret — skipping eval."; exit 0; fi
           printf 'MODEL_API_KEY=%s\nHF_TOKEN=%s\n' "$MODEL_API_KEY" "$HF_TOKEN" > /tmp/eval.env
           uv run python eval/run.py /tmp/entry-dev --env-file /tmp/eval.env --tasks wind-diaphragm-shear --trials 1 --model-base-url https://integrate.api.nvidia.com/v1
